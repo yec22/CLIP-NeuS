@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=1 python exp_runner.py --mode validate_mesh --conf ./confs/wmask_clip.conf --case dtu_scan105 --is_continue
