@@ -2,7 +2,8 @@ import torch
 import torch.nn.functional as F
 import cv2 as cv
 import numpy as np
-import os
+import os, copy
+import json
 from glob import glob
 from icecream import ic
 from scipy.spatial.transform import Rotation as Rot
@@ -68,8 +69,10 @@ class Dataset:
         self.device = torch.device('cuda')
         self.conf = conf
         self.clip = CLIP_Encoder(self.device)
+        self.stage = conf.get_int('stage')
 
         self.data_dir = conf.get_string('data_dir')
+        self.prior_dir = os.path.join(self.data_dir, 'prior')
         self.render_cameras_name = conf.get_string('render_cameras_name')
         self.object_cameras_name = conf.get_string('object_cameras_name')
 
@@ -79,26 +82,40 @@ class Dataset:
         camera_dict = np.load(os.path.join(self.data_dir, self.render_cameras_name))
         self.camera_dict = camera_dict
 
-        self.select_sparse_view = [0, 2, 4]
-
-        self.images_lis = sorted(glob(os.path.join(self.data_dir, 'image/*.png')))
+        self.select_sparse_view = conf.get_list('training_views')
+        
+        if self.stage == 1:
+            self.images_lis = sorted(glob(os.path.join(self.prior_dir, '*_rgb.png')))
+        if self.stage == 2:
+            self.images_lis = sorted(glob(os.path.join(self.prior_dir, '*_rgb.png')))
+            # self.images_lis = sorted(glob(os.path.join(self.data_dir, 'image/*.png')))
         self.images_lis = [self.images_lis[i] for i in self.select_sparse_view]
         self.n_images = len(self.images_lis)
         self.images_np = np.stack([cv.imread(im_name) for im_name in self.images_lis]) / 256.0
 
-        self.masks_lis = sorted(glob(os.path.join(self.data_dir, 'mask/*.png')))
+        if self.stage == 1:
+            self.masks_lis = sorted(glob(os.path.join(self.prior_dir, '*_mask.png')))
+        if self.stage == 2:
+            self.masks_lis = sorted(glob(os.path.join(self.prior_dir, '*_mask.png')))
+            # self.masks_lis = sorted(glob(os.path.join(self.data_dir, 'mask/*.png')))
         self.masks_lis = [self.masks_lis[i] for i in self.select_sparse_view]
-        self.masks_np = np.stack([cv.imread(im_name) for im_name in self.masks_lis]) / 256.0
+        self.masks_np = np.stack([cv.imread(im_name)[:, :, 0] for im_name in self.masks_lis]) / 256.0
+        self.masks_np = self.masks_np > 0.5
 
         self.H = self.images_np[0].shape[0]
         self.W = self.images_np[0].shape[1]
 
+        with open(os.path.join(self.prior_dir, 'meta_data.json'), 'r') as f:
+            self.resize_camera = json.load(f)
+        self.resize_camera = self.resize_camera["frames"]
+        self.resize_camera = [self.resize_camera[i] for i in self.select_sparse_view]
+
         self.gt_clip_feat = []
         for img_idx, mask_idx in zip(self.images_lis, self.masks_lis):
             img = cv.imread(img_idx, -1)
-            masks = (cv.imread(mask_idx, -1) / 256.0).astype(np.bool)
+            masks = (cv.imread(mask_idx, -1) / 256.0).astype(bool)
             img[~masks] = 0.0
-            img = cv.resize(img, (self.W // 4, self.H // 4), interpolation=cv.INTER_CUBIC)
+            # img = cv.resize(img, (self.W // 4, self.H // 4), interpolation=cv.INTER_CUBIC)
             img = torchvision.transforms.ToTensor()(img)
 
             with torch.no_grad():
@@ -119,12 +136,16 @@ class Dataset:
         self.random_world_mat =  [camera_dict['world_mat_%d' % idx].astype(np.float32) for idx in range(self.random_pose_num)]
         self.random_scale_mat = [camera_dict['scale_mat_%d' % idx].astype(np.float32) for idx in range(self.random_pose_num)]
 
-
-        for scale_mat, world_mat in zip(self.scale_mats_np, self.world_mats_np):
+        for i, (scale_mat, world_mat) in enumerate(zip(self.scale_mats_np, self.world_mats_np)):
             P = world_mat @ scale_mat
             P = P[:3, :4]
             intrinsics, pose = load_K_Rt_from_P(None, P)
-            self.intrinsics_all.append(torch.from_numpy(intrinsics).float())
+            resize_intrinsics = np.array(self.resize_camera[i]["intrinsics"]).astype(np.float32)
+            if self.stage == 1:
+                self.intrinsics_all.append(torch.from_numpy(resize_intrinsics).float())
+            if self.stage == 2:
+                self.intrinsics_all.append(torch.from_numpy(resize_intrinsics).float())
+                # self.intrinsics_all.append(torch.from_numpy(intrinsics).float())
             self.pose_all.append(torch.from_numpy(pose).float())
 
         self.rand_pose_list = []
@@ -137,8 +158,19 @@ class Dataset:
         self.global_intrinsic = self.intrinsics_all[0].to(self.device)
         self.global_intrinsic_inv = torch.inverse(self.global_intrinsic)
 
-        self.images = torch.from_numpy(self.images_np.astype(np.float32)).cpu()  # [n_images, H, W, 3]
-        self.masks  = torch.from_numpy(self.masks_np.astype(np.float32)).cpu()   # [n_images, H, W, 3]
+        self.images = torch.from_numpy(self.images_np.astype(np.float32)).cpu()                # [n_images, H, W, 3]
+        self.masks  = torch.from_numpy(self.masks_np.astype(np.float32)).unsqueeze(-1).cpu()   # [n_images, H, W, 1]
+        if self.stage == 1:
+            self.normal_lis = sorted(glob(os.path.join(self.prior_dir, '*_normal.png')))
+            self.normal_lis = [self.normal_lis[i] for i in self.select_sparse_view]
+            self.normal_np = self.read_normal()
+            self.normals = torch.from_numpy(self.normal_np.astype(np.float32)).cpu()                # [n_images, H, W, 3]
+
+            self.depth_lis = sorted(glob(os.path.join(self.prior_dir, '*_depth.npy')))
+            self.depth_lis = [self.depth_lis[i] for i in self.select_sparse_view]
+            self.depth_np = np.stack([np.load(im_name) for im_name in self.depth_lis])
+            self.depths = torch.from_numpy(self.depth_np.astype(np.float32)).unsqueeze(-1).cpu()    # [n_images, H, W, 1]
+
         self.intrinsics_all = torch.stack(self.intrinsics_all).to(self.device)   # [n_images, 4, 4]
         self.intrinsics_all_inv = torch.inverse(self.intrinsics_all)  # [n_images, 4, 4]
         self.focal = self.intrinsics_all[0][0, 0]
@@ -164,6 +196,38 @@ class Dataset:
         print('poses', self.pose_all.shape)
 
         print('Load data: End')
+
+    def read_normal(self):
+        data_list = []
+        for i, im_name in enumerate(self.normal_lis):
+            normal = cv.imread(im_name)
+            normal = cv.cvtColor(normal, cv.COLOR_BGR2RGB) # BGR -> RGB
+            normal = (normal / 255.0 - 0.5) * 2.0 # [0, 255] -> [-1, 1]
+            
+            ex_i = np.linalg.inv(self.pose_all[i])
+            normal_world = self.get_world_normal(normal.reshape(-1, 3), ex_i).reshape(self.H, self.W, 3)
+            
+            data_list.append(normal_world)
+
+        return np.stack(data_list)
+
+    def get_world_normal(self, normal, extrin):
+        '''
+        Args:
+            normal: N*3
+            extrinsics: 4*4, world to camera
+        Return:
+            normal: N*3, in world space 
+        '''
+        extrinsics = copy.deepcopy(extrin)        
+        assert extrinsics.shape[0] == 4
+        normal = normal.transpose()
+        extrinsics[:3, 3] = np.zeros(3)  # only rotation, no translation
+        normal_world = np.matmul(np.linalg.inv(extrinsics),
+                                np.vstack((normal, np.ones((1, normal.shape[1])))))[:3]
+        normal_world = normal_world.transpose((1, 0))
+
+        return normal_world
 
     def get_avg_dist(self, pose_list):
         cam_dist = 0.
@@ -194,13 +258,19 @@ class Dataset:
         pixels_x = torch.randint(low=0, high=self.W, size=[batch_size])
         pixels_y = torch.randint(low=0, high=self.H, size=[batch_size])
         color = self.images[img_idx][(pixels_y, pixels_x)]    # batch_size, 3
-        mask = self.masks[img_idx][(pixels_y, pixels_x)]      # batch_size, 3
+        mask = self.masks[img_idx][(pixels_y, pixels_x)]      # batch_size, 1
+        if self.stage == 1:
+            normal = self.normals[img_idx][(pixels_y, pixels_x)]    # batch_size, 3
+            depth = self.depths[img_idx][(pixels_y, pixels_x)]      # batch_size, 1
+        if self.stage == 2:
+            normal = torch.zeros_like(color).to(color.device)
+            depth = torch.zeros_like(mask).to(mask.device)
         p = torch.stack([pixels_x, pixels_y, torch.ones_like(pixels_y)], dim=-1).float()  # batch_size, 3
         p = torch.matmul(self.intrinsics_all_inv[img_idx, None, :3, :3], p[:, :, None]).squeeze() # batch_size, 3
         rays_v = p / torch.linalg.norm(p, ord=2, dim=-1, keepdim=True)    # batch_size, 3
         rays_v = torch.matmul(self.pose_all[img_idx, None, :3, :3], rays_v[:, :, None]).squeeze()  # batch_size, 3
         rays_o = self.pose_all[img_idx, None, :3, 3].expand(rays_v.shape) # batch_size, 3
-        return torch.cat([rays_o.cpu(), rays_v.cpu(), color, mask[:, :1]], dim=-1).cuda()    # batch_size, 10
+        return torch.cat([rays_o.cpu(), rays_v.cpu(), color, mask[:, :1], normal, depth], dim=-1).cuda()    # batch_size, 14
 
     def gen_rays_given_pose(self, pose, resolution_level=1):
         l = resolution_level

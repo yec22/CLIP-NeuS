@@ -2,6 +2,7 @@ import os
 import time
 import logging
 import argparse
+from math import sqrt
 import numpy as np
 import cv2 as cv
 import trimesh
@@ -14,8 +15,10 @@ from icecream import ic
 from tqdm import tqdm
 from pyhocon import ConfigFactory
 from models.dataset import Dataset
-from models.fields import RenderingNetwork, SDFNetwork, SingleVarianceNetwork, NeRF
+from models.fields import RenderingNetwork, Cascaded_SDFNetwork, SingleVarianceNetwork, NeRF
 from models.renderer import NeuSRenderer
+from torchvision import transforms
+
 
 class TVLoss(torch.nn.Module):
     """
@@ -38,8 +41,45 @@ class TVLoss(torch.nn.Module):
     def _tensor_size(self, t):
         return t.size()[1] * t.size()[2] * t.size()[3]
 
+def compute_scale_and_shift(prediction, target, mask):
+    # system matrix: A = [[a_00, a_01], [a_10, a_11]]
+    a_00 = torch.sum(mask * prediction * prediction, (1, 2))
+    a_01 = torch.sum(mask * prediction, (1, 2))
+    a_11 = torch.sum(mask, (1, 2))
+
+    # right hand side: b = [b_0, b_1]
+    b_0 = torch.sum(mask * prediction * target, (1, 2))
+    b_1 = torch.sum(mask * target, (1, 2))
+
+    # solution: x = A^-1 . b = [[a_11, -a_01], [-a_10, a_00]] / (a_00 * a_11 - a_01 * a_10) . b
+    x_0 = torch.zeros_like(b_0)
+    x_1 = torch.zeros_like(b_1)
+
+    det = a_00 * a_11 - a_01 * a_01
+    valid = det.nonzero()
+
+    x_0[valid] = (a_11[valid] * b_0[valid] - a_01[valid] * b_1[valid]) / det[valid]
+    x_1[valid] = (-a_01[valid] * b_0[valid] + a_00[valid] * b_1[valid]) / det[valid]
+
+    return x_0, x_1
+
+class ScaleAndShiftInvariantLoss(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, prediction, target, mask):
+        target = target * 50 + 0.5
+        scale, shift = compute_scale_and_shift(prediction, target, mask)
+        self.prediction_depth = scale.view(-1, 1, 1) * prediction + shift.view(-1, 1, 1)
+        
+        depth_error = (self.prediction_depth - target) * mask
+        depth_error = depth_error.reshape(1, -1).permute(1, 0)
+        depth_loss = F.l1_loss(depth_error, torch.zeros_like(depth_error), reduction='sum') / (mask.sum() + 1e-5)
+
+        return depth_loss
+
 class Runner:
-    def __init__(self, conf_path, mode='train', case='CASE_NAME', is_continue=False):
+    def __init__(self, conf_path, mode='train', case='CASE_NAME', is_continue=False, ckpt=''):
         self.device = torch.device('cuda')
 
         # Configuration
@@ -54,7 +94,7 @@ class Runner:
         self.base_exp_dir = self.conf['general.base_exp_dir']
         os.makedirs(self.base_exp_dir, exist_ok=True)
         self.dataset = Dataset(self.conf['dataset'])
-        self.iter_step = 0
+        self.iter_step = self.conf.get_int('train.start_iter')
 
         # Training parameters
         self.end_iter = self.conf.get_int('train.end_iter')
@@ -73,18 +113,24 @@ class Runner:
         self.clip_stop = self.conf.get_int('train.stop_clip')
 
         # Weights
+        self.color_weight = self.conf.get_float('train.color_weight')
         self.igr_weight = self.conf.get_float('train.igr_weight')
         self.mask_weight = self.conf.get_float('train.mask_weight')
         self.clip_weight = self.conf.get_float('train.clip_weight')
+        self.depth_tv_weight = self.conf.get_float('train.depth_tv_weight')
+        self.normal_tv_weight = self.conf.get_float('train.normal_tv_weight')
+        self.normal_weight = self.conf.get_float('train.normal_weight')
+        self.depth_weight = self.conf.get_float('train.depth_weight')
         self.is_continue = is_continue
         self.mode = mode
         self.model_list = []
         self.writer = None
+        self.stage = self.conf.get_int('model.cascaded_network.stage')
 
         # Networks
         params_to_train = []
         self.nerf_outside = NeRF(**self.conf['model.nerf']).to(self.device)
-        self.sdf_network = SDFNetwork(**self.conf['model.sdf_network']).to(self.device)
+        self.sdf_network = Cascaded_SDFNetwork(**self.conf['model.cascaded_network']).to(self.device)
         self.deviation_network = SingleVarianceNetwork(**self.conf['model.variance_network']).to(self.device)
         self.color_network = RenderingNetwork(**self.conf['model.rendering_network']).to(self.device)
         params_to_train += list(self.nerf_outside.parameters())
@@ -111,6 +157,9 @@ class Runner:
             model_list.sort()
             latest_model_name = model_list[-1]
 
+        if ckpt != '':
+            latest_model_name = ckpt
+
         if latest_model_name is not None:
             logging.info('Find checkpoint: {}'.format(latest_model_name))
             self.load_checkpoint(latest_model_name)
@@ -118,6 +167,26 @@ class Runner:
         # Backup codes and configs for debug
         if self.mode[:5] == 'train':
             self.file_backup()
+
+    def get_angular_error(self, normals_source, normals_target, mask):
+        '''Get angular error betwee predicted normals and ground truth normals
+        Args:
+            normals_source, normals_target: N*3
+            mask: N*1 (optional, default: None)
+        Return:
+            angular_error: float
+        '''
+        inner = (normals_source * normals_target).sum(dim=-1, keepdim=True)
+        norm_source =  torch.linalg.norm(normals_source, dim=-1, ord=2, keepdim=True)
+        norm_target = torch.linalg.norm(normals_target, dim=-1, ord=2, keepdim=True)
+        angles = torch.arccos(inner/((norm_source*norm_target) + 1e-5))
+        assert not torch.isnan(angles).any()
+        if mask.ndim == 1:
+            mask =  mask.unsqueeze(-1)
+        assert angles.ndim == mask.ndim
+        
+        angular_error = F.l1_loss(angles*mask, torch.zeros_like(angles), reduction='sum') / (mask.sum() + 1e-5)
+        return angular_error
 
     def train(self):
         self.writer = SummaryWriter(log_dir=os.path.join(self.base_exp_dir, 'logs'))
@@ -128,7 +197,7 @@ class Runner:
         for iter_i in tqdm(range(res_step)):
             data = self.dataset.gen_random_rays_at(image_perm[self.iter_step % len(image_perm)], self.batch_size)
 
-            rays_o, rays_d, true_rgb, mask = data[:, :3], data[:, 3: 6], data[:, 6: 9], data[:, 9: 10]
+            rays_o, rays_d, true_rgb, mask, normal_gt, depth_gt = data[:, :3], data[:, 3: 6], data[:, 6: 9], data[:, 9: 10], data[:, 10: 13], data[:, 13: 14]
             near, far = self.dataset.near_far_from_sphere(rays_o, rays_d)
 
             background_rgb = None
@@ -151,38 +220,66 @@ class Runner:
             gradient_error = render_out['gradient_error']
             weight_max = render_out['weight_max']
             weight_sum = render_out['weight_sum']
+            normal_pred = render_out['normal_map']
+            depth_pred = render_out['depth_map'].unsqueeze(-1)
+            
+            depth_pred = depth_pred.reshape(int(sqrt(self.batch_size)), int(sqrt(self.batch_size)), 1).permute(2, 0, 1)
+            depth_gt = depth_gt.reshape(int(sqrt(self.batch_size)), int(sqrt(self.batch_size)), 1).permute(2, 0, 1)
+            depth_mask = mask.clone().reshape(int(sqrt(self.batch_size)), int(sqrt(self.batch_size)), 1).permute(2, 0, 1)
 
             # Loss
-            clip_loss = None
-            if (self.iter_step + 1) % self.clip_loss_freq == 0 and self.clip_weight > 0 and self.iter_step < self.clip_stop:
+            clip_loss, normal_tv_loss, depth_tv_loss = None, None, None
+            normal_loss, depth_loss = None, None
+            if (self.iter_step + 1) % self.clip_loss_freq == 0 and self.iter_step < self.clip_stop and self.clip_weight > 0:
                 rand_idx = torch.randint(low = 0, high = self.dataset.random_pose_num, size=[1]).item()
                 rand_pose = self.dataset.rand_pose_list[rand_idx]
                 gt_idx = torch.randint(low = 0, high = self.dataset.n_images, size=[1]).item()
-                render_img, render_normal, render_depth = self.render_image_from_pose(gt_idx, rand_pose, 4, self.iter_step + 1)
-
-                normal_tv_loss = TVLoss()(render_normal.unsqueeze(0))
-                depth_tv_loss = TVLoss()(render_depth.unsqueeze(0).unsqueeze(-1))
+                render_img, render_normal, render_depth, normal_patch, depth_patch = self.render_image_from_pose(gt_idx, rand_pose, 5, self.iter_step + 1)
+                
+                h, w, _ = render_img.shape
+                trans = transforms.Compose([
+                    transforms.CenterCrop(h),
+                ])
+                render_img = trans(render_img).permute(2, 0, 1).unsqueeze(0) # [1, C, H, W]
+                render_img = F.interpolate(render_img, size=(224, 224), mode='bilinear').squeeze()
 
                 render_clip = self.dataset.clip.CLIP_Encode(render_img).squeeze().float()
                 gt_clip = self.dataset.gt_clip_feat[gt_idx]
                 
-                clip_error = render_clip - gt_clip
-                clip_loss = F.l1_loss(clip_error, torch.zeros_like(clip_error))
+                clip_loss = 1 - torch.cosine_similarity(gt_clip, render_clip, dim=-1)
+
+                normal_tv_loss = TVLoss()(normal_patch)
+                depth_tv_loss = TVLoss()(depth_patch)
 
             color_error = (color_fine - true_rgb) * mask
             color_fine_loss = F.l1_loss(color_error, torch.zeros_like(color_error), reduction='sum') / mask_sum
             psnr = 20.0 * torch.log10(1.0 / (((color_fine - true_rgb)**2 * mask).sum() / (mask_sum * 3.0)).sqrt())
 
+            if self.stage == 1:
+                normal_loss = self.get_angular_error(normal_pred, normal_gt, mask)
+                depth_loss = ScaleAndShiftInvariantLoss()(depth_pred, depth_gt, depth_mask)
+            if self.stage == 2:
+                normal_loss = 0.0
+                depth_loss = 0.0
+
             eikonal_loss = gradient_error
 
             mask_loss = F.binary_cross_entropy(weight_sum.clip(1e-3, 1.0 - 1e-3), mask)
 
-            loss = color_fine_loss +\
-                   eikonal_loss * self.igr_weight +\
-                   mask_loss * self.mask_weight
+            loss = color_fine_loss * self.color_weight +\
+                eikonal_loss * self.igr_weight +\
+                mask_loss * self.mask_weight +\
+                normal_loss * self.normal_weight +\
+                depth_loss * self.depth_weight
             
             if clip_loss is not None:
                 loss += clip_loss * self.clip_weight
+            
+            if normal_tv_loss is not None:
+                loss += normal_tv_loss * self.normal_tv_weight
+            
+            if depth_tv_loss is not None:
+                loss += depth_tv_loss * self.depth_tv_weight
 
             self.optimizer.zero_grad()
             loss.backward()
@@ -200,9 +297,13 @@ class Runner:
 
             if self.iter_step % self.report_freq == 0:
                 print(self.base_exp_dir)
-                print('iter:{:8>d} loss = {} lr={}'.format(self.iter_step, loss, self.optimizer.param_groups[0]['lr']))
+                print('iter:{:8>d} loss = {} normal_loss = {} depth_loss = {}'.format(self.iter_step, loss, normal_loss, depth_loss))
                 if clip_loss is not None:
                     print('iter:{:8>d} clip_loss = {} lr={}'.format(self.iter_step, clip_loss, self.optimizer.param_groups[0]['lr']))
+                if normal_tv_loss is not None:
+                    print('iter:{:8>d} normal_tv_loss = {} lr={}'.format(self.iter_step, normal_tv_loss, self.optimizer.param_groups[0]['lr']))
+                if depth_tv_loss is not None:
+                    print('iter:{:8>d} depth_tv_loss = {} lr={}'.format(self.iter_step, depth_tv_loss, self.optimizer.param_groups[0]['lr']))
 
             if self.iter_step % self.save_freq == 0:
                 self.save_checkpoint()
@@ -363,9 +464,9 @@ class Runner:
                                               cos_anneal_ratio=self.get_cos_anneal_ratio(),
                                               background_rgb=background_rgb)
 
-            out_rgb_fine.append(render_out['color_fine'].detach())
-            out_depth_fine.append(render_out['depth_map'].detach())
-            out_normal_fine.append(render_out['normal_map'].detach())
+            out_rgb_fine.append(render_out['color_fine'])
+            out_depth_fine.append(render_out['depth_map'])
+            out_normal_fine.append(render_out['normal_map'])
             
             torch.cuda.empty_cache()
             del render_out
@@ -387,13 +488,23 @@ class Runner:
         vis_img_depth = (vis_img_depth - mi) / (ma - mi + 1e-6) # normalize to 0~1
         vis_img_depth = (255 * vis_img_depth).astype(np.uint8)
         vis_img_depth = cv.applyColorMap(vis_img_depth, cv.COLORMAP_JET)
+
+        patch_size = 4
+        patch_x = torch.randint(low=patch_size, high=W-patch_size-1, size=[64])
+        patch_y = torch.randint(low=patch_size, high=H-patch_size-1, size=[64])
+        patch_normal, patch_depth = [], []
+        for i in range(len(patch_x)):
+            patch_normal.append(img_normal.reshape([H, W, 3])[patch_y[i]-patch_size:patch_y[i]+patch_size, patch_x[i]-patch_size:patch_x[i]+patch_size])
+            patch_depth.append(img_depth.unsqueeze(-1)[patch_y[i]-patch_size:patch_y[i]+patch_size, patch_x[i]-patch_size:patch_x[i]+patch_size])
+        patch_normal = torch.stack(patch_normal, dim=0)
+        patch_depth = torch.stack(patch_depth, dim=0)
         
         os.makedirs(os.path.join(self.base_exp_dir, 'clip_novel_view'), exist_ok=True)
         if iter % self.report_freq == 0:
             cv.imwrite(os.path.join(self.base_exp_dir, 'clip_novel_view','{:0>8d}_clip.png'.format(self.iter_step)),
                            np.concatenate([vis_img, vis_img_depth, vis_normal_map, self.dataset.image_at(idx, resolution_level=resolution_level)]))
 
-        return img_fine, img_normal.reshape([H, W, 3]), img_depth
+        return img_fine, img_normal.reshape([H, W, 3]), img_depth, patch_normal, patch_depth
 
 
     def render_novel_image(self, idx_0, idx_1, ratio, resolution_level):
@@ -486,12 +597,13 @@ if __name__ == '__main__':
     parser.add_argument('--is_continue', default=False, action="store_true")
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--case', type=str, default='')
+    parser.add_argument('--ckpt', type=str, default='')
 
     args = parser.parse_args()
     set_seed(0)
 
     torch.cuda.set_device(args.gpu)
-    runner = Runner(args.conf, args.mode, args.case, args.is_continue)
+    runner = Runner(args.conf, args.mode, args.case, args.is_continue, args.ckpt)
 
     if args.mode == 'train':
         runner.train()
@@ -507,4 +619,4 @@ if __name__ == '__main__':
                             [-0.8241403, 0.5624584, 0.06658301, -0.33522356],
                             [0.47609568, 0.6242784, 0.61936206, -2.0749938 ],
                             [0.        , 0.       , 0.        , 1.        ]], dtype=torch.float32)
-        runner.render_image_from_pose(0, pose.cuda(), 4, 0)
+        runner.render_image_from_pose(0, pose.cuda(), 5, 0)

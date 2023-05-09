@@ -5,6 +5,132 @@ import numpy as np
 from models.embedder import get_embedder
 
 
+class Cascaded_SDFNetwork(nn.Module):
+    def __init__(self,
+                 stage,
+                 d_in_1,
+                 d_out_1,
+                 d_hidden_1,
+                 n_layers_1,
+                 skip_in_1,
+                 multires_1,
+                 d_in_2,
+                 d_out_2,
+                 d_hidden_2,
+                 n_layers_2,
+                 skip_in_2,
+                 multires_2,
+                 bias=0.5,
+                 scale=1,
+                 geometric_init=True,
+                 weight_norm=True,
+                 ):
+        super(Cascaded_SDFNetwork, self).__init__()
+        self.stage = stage
+
+        self.coarse_sdf = SDFNetwork(d_in_1, d_out_1, d_hidden_1, n_layers_1, skip_in_1,
+                                     multires_1, bias, scale, geometric_init, weight_norm)
+        
+        self.fine_sdf = Refine_SDFNetwork(d_in_2, d_out_2, d_out_1 - 1, d_hidden_2, n_layers_2, skip_in_2,
+                                        multires_2, bias, scale, weight_norm)
+        
+    
+    def forward(self, inputs):
+        coarse_output = self.coarse_sdf(inputs)
+        if self.stage == 1:
+            return coarse_output
+        
+        sdf_coarse = coarse_output[:, :1]
+        feat_coarse = coarse_output[:, 1:]
+
+        fine_output = self.fine_sdf(inputs, feat_coarse)
+        sdf_fine = fine_output[:, :1]
+        feat_fine = fine_output[:, 1:]
+        sdf = sdf_fine + sdf_coarse
+        feat = feat_fine + feat_coarse
+
+        return torch.cat([sdf, feat], dim=-1)  
+    
+    def freeze_param(self):
+        for param in self.coarse_sdf.parameters():
+            param.requires_grad = False
+        
+    def sdf(self, x):
+        return self.forward(x)[:, :1]
+
+    def gradient(self, x):
+        x.requires_grad_(True)
+        y = self.sdf(x)
+        d_output = torch.ones_like(y, requires_grad=False, device=y.device)
+        gradients = torch.autograd.grad(
+            outputs=y,
+            inputs=x,
+            grad_outputs=d_output,
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True)[0]
+        return gradients.unsqueeze(1)
+
+class Refine_SDFNetwork(nn.Module):
+    def __init__(self,
+                 d_in,
+                 d_out,
+                 d_feat,
+                 d_hidden,
+                 n_layers,
+                 skip_in,
+                 multires=0,
+                 bias=0.5,
+                 scale=1,
+                 weight_norm=True):
+        super(Refine_SDFNetwork, self).__init__()
+
+        dims = [d_feat] + [d_hidden for _ in range(n_layers)] + [d_out]
+        self.embed_fn_fine = None
+        self.skip_in = skip_in
+
+        if multires > 0:
+            embed_fn, input_ch = get_embedder(multires, input_dims=d_in)
+            self.embed_fn_fine = embed_fn
+            dims[0] += input_ch
+
+        self.num_layers = len(dims)
+        self.scale = scale
+
+        for l in range(0, self.num_layers - 1):
+            if l + 1 in self.skip_in:
+                out_dim = dims[l + 1] - input_ch
+            else:
+                out_dim = dims[l + 1]
+
+            lin = nn.Linear(dims[l], out_dim)
+            if l == self.num_layers - 2:
+                nn.init.constant_(lin.bias, 0)
+
+            if weight_norm:
+                lin = nn.utils.weight_norm(lin)
+
+            setattr(self, "lin" + str(l), lin)
+        
+        self.activation = nn.Softplus(beta=100)
+    
+    def forward(self, inputs, feat):
+        inputs = inputs * self.scale
+        if self.embed_fn_fine is not None:
+            inputs = self.embed_fn_fine(inputs)
+
+        x = torch.cat([inputs, feat], 1)
+        for l in range(0, self.num_layers - 1):
+            lin = getattr(self, "lin" + str(l))
+            if l in self.skip_in:
+                x = torch.cat([x, inputs], 1) / np.sqrt(2)
+            x = lin(x)
+
+            if l < self.num_layers - 2:
+                x = self.activation(x)
+        return torch.cat([x[:, :1] / self.scale, x[:, 1:]], dim=-1)
+
+
 # This implementation is borrowed from IDR: https://github.com/lioryariv/idr
 class SDFNetwork(nn.Module):
     def __init__(self,
@@ -87,29 +213,11 @@ class SDFNetwork(nn.Module):
                 x = self.activation(x)
         return torch.cat([x[:, :1] / self.scale, x[:, 1:]], dim=-1)
 
-    def sdf(self, x):
-        return self.forward(x)[:, :1]
-
-    def sdf_hidden_appearance(self, x):
-        return self.forward(x)
-
-    def gradient(self, x):
-        x.requires_grad_(True)
-        y = self.sdf(x)
-        d_output = torch.ones_like(y, requires_grad=False, device=y.device)
-        gradients = torch.autograd.grad(
-            outputs=y,
-            inputs=x,
-            grad_outputs=d_output,
-            create_graph=True,
-            retain_graph=True,
-            only_inputs=True)[0]
-        return gradients.unsqueeze(1)
-
 
 # This implementation is borrowed from IDR: https://github.com/lioryariv/idr
 class RenderingNetwork(nn.Module):
     def __init__(self,
+                 stage,
                  d_feature,
                  mode,
                  d_in,
@@ -122,12 +230,14 @@ class RenderingNetwork(nn.Module):
         super().__init__()
 
         self.mode = mode
+        self.stage = stage
         self.squeeze_out = squeeze_out
         dims = [d_in + d_feature] + [d_hidden for _ in range(n_layers)] + [d_out]
 
         self.embedview_fn = None
         if multires_view > 0:
             embedview_fn, input_ch = get_embedder(multires_view)
+            self.embed_ch = (input_ch - 3) // 2
             self.embedview_fn = embedview_fn
             dims[0] += (input_ch - 3)
 
@@ -147,6 +257,8 @@ class RenderingNetwork(nn.Module):
     def forward(self, points, normals, view_dirs, feature_vectors):
         if self.embedview_fn is not None:
             view_dirs = self.embedview_fn(view_dirs)
+            if self.stage == 1:
+                view_dirs[-self.embed_ch:] = 0
 
         rendering_input = None
 
