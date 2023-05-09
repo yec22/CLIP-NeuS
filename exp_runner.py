@@ -234,7 +234,7 @@ class Runner:
                 rand_idx = torch.randint(low = 0, high = self.dataset.random_pose_num, size=[1]).item()
                 rand_pose = self.dataset.rand_pose_list[rand_idx]
                 gt_idx = torch.randint(low = 0, high = self.dataset.n_images, size=[1]).item()
-                render_img, render_normal, render_depth, normal_patch, depth_patch = self.render_image_from_pose(gt_idx, rand_pose, 5, self.iter_step + 1)
+                render_img, render_normal, render_depth, normal_patch, depth_patch = self.render_image_from_pose(gt_idx, rand_pose, 6, self.iter_step + 1)
                 
                 h, w, _ = render_img.shape
                 trans = transforms.Compose([
@@ -248,8 +248,8 @@ class Runner:
                 
                 clip_loss = 1 - torch.cosine_similarity(gt_clip, render_clip, dim=-1)
 
-                normal_tv_loss = TVLoss()(normal_patch)
-                depth_tv_loss = TVLoss()(depth_patch)
+                # normal_tv_loss = TVLoss()(normal_patch)
+                # depth_tv_loss = TVLoss()(depth_patch)
 
             color_error = (color_fine - true_rgb) * mask
             color_fine_loss = F.l1_loss(color_error, torch.zeros_like(color_error), reduction='sum') / mask_sum
@@ -619,4 +619,4 @@ if __name__ == '__main__':
                             [-0.8241403, 0.5624584, 0.06658301, -0.33522356],
                             [0.47609568, 0.6242784, 0.61936206, -2.0749938 ],
                             [0.        , 0.       , 0.        , 1.        ]], dtype=torch.float32)
-        runner.render_image_from_pose(0, pose.cuda(), 5, 0)
+        runner.render_image_from_pose(0, pose.cuda(), 6, 0)

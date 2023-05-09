@@ -89,7 +89,7 @@ def clean_points_by_mask(conf, points, scan, minimal_vis=0, mask_dilated_size=11
     inside_mask = np.zeros(len(points))
 
     n_images = 49 if int(scan[-3:]) < 83 else 64
-    imgs_idx = [i for i in range(n_images)]
+    imgs_idx = conf.get_list('dataset.training_views')
 
     for i in imgs_idx:
         P = camera_dict['world_mat_{}'.format(i)]
@@ -149,7 +149,7 @@ def clean_mesh_faces_outside_frustum(old_mesh_file, new_mesh_file, scan, H=1200,
     mask_lis = sorted(glob(os.path.join(DTU_DIR, 'mask/*.png')))
     
     n_images = 49 if int(scan[-3:]) < 83 else 64
-    imgs_idx = [i for i in range(n_images)]
+    imgs_idx = conf.get_list('dataset.training_views')
 
     mesh = trimesh.load(old_mesh_file)
     intersector = trimesh.ray.ray_pyembree.RayMeshIntersector(mesh)
